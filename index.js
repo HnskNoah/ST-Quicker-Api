@@ -1,5 +1,5 @@
 import { extension_settings } from '../../../extensions.js';
-import { chat_completion_sources, oai_settings, proxies } from '../../../openai.js';
+import { chat_completion_sources, oai_settings, openai_settings, openai_setting_names, proxies } from '../../../openai.js';
 import { SECRET_KEYS, secret_state } from '../../../secrets.js';
 import { Popup, POPUP_TYPE } from '../../../popup.js';
 import { eventSource, event_types, getRequestHeaders, saveSettingsDebounced } from '../../../../script.js';
@@ -151,6 +151,10 @@ function normalizeQuickAction(raw, index = 0) {
         preset: normalizeText(raw?.preset).slice(0, 500),
         profileId: normalizeText(raw?.profileId),
         model: normalizeText(raw?.model).slice(0, 500),
+        presetCards: {
+            preset: normalizeText(raw?.presetCards?.preset).slice(0, 500),
+            profileId: normalizeText(raw?.presetCards?.profileId).slice(0, 500),
+        },
         sequence: Number.isFinite(Number(raw?.sequence)) ? Number(raw.sequence) : index,
     };
 }
@@ -225,7 +229,7 @@ function initializeSettings() {
         ? value.quickActionPlacement
         : 'rightSendForm';
     value.quickActions = Array.isArray(value.quickActions)
-        ? value.quickActions.map(normalizeQuickAction).filter(action => action.preset || action.profileId || action.model)
+        ? value.quickActions.map(normalizeQuickAction).filter(action => action.preset || action.profileId || action.model || action.presetCards?.preset)
         : [];
     value.quickActions.sort((a, b) => a.sequence - b.sequence).forEach((action, index) => { action.sequence = index; });
     for (const key of Object.keys(value.blockedSecretKeys)) {
@@ -1664,14 +1668,33 @@ function escapeHtml(value) {
     })[character]);
 }
 
-function presetOptionsHtml(selected = '') {
+/** preset-cards profile 在「预设」下拉中的 value 编码：pc::预设名::profileId。 */
+function presetCardsPresetValue(preset, profileId) {
+    return `pc::${preset}::${profileId}`;
+}
+
+function presetOptionsHtml(selected = '', presetCardsValue = '') {
     const names = $('#settings_preset_openai option').map((_, option) => normalizeText(option.textContent)).get().filter(Boolean);
     const missing = selected && !names.includes(selected)
         ? [`<option value="${escapeHtml(selected)}" selected>⚠ 已不存在：${escapeHtml(selected)}</option>`]
         : [];
-    return ['<option value="">— 不切换 preset —</option>', ...missing, ...names.map(name =>
+    const nativeOptions = ['<option value="">— 不切换预设 —</option>', ...missing, ...names.map(name =>
         `<option value="${escapeHtml(name)}"${name === selected ? ' selected' : ''}>${escapeHtml(name)}</option>`,
-    )].join('');
+    )];
+    // 追加 preset-cards profiles：按预设分组（optgroup 标题=预设名），选项只显示 profile 名，避免每项重复预设名
+    const pcGroups = [];
+    for (const presetName of Object.keys(openai_setting_names)) {
+        const idx = openai_setting_names[presetName];
+        const preset = openai_settings[idx];
+        const profiles = preset?.extensions?.preset_cards?.profiles;
+        if (!Array.isArray(profiles) || profiles.length === 0) continue;
+        const groupOptions = profiles.map(profile => {
+            const value = presetCardsPresetValue(presetName, String(profile.id));
+            return `<option value="${escapeHtml(value)}"${value === presetCardsValue ? ' selected' : ''}>${escapeHtml(profile.name || String(profile.id))}</option>`;
+        }).join('');
+        pcGroups.push(`<optgroup label="preset-cards · ${escapeHtml(presetName)}">${groupOptions}</optgroup>`);
+    }
+    return nativeOptions.concat(pcGroups).join('');
 }
 
 function profileOptionsHtml(selected = '') {
@@ -1690,6 +1713,20 @@ function modelSuggestionsForProfile(profileId = '') {
     if (profile.format === 'openai') return normalizeModelList([profile.model, ...(profile.availableModels || [])]);
     const native = $(FORMATS[profile.format].modelInput).find('option').map((_, option) => String(option.value || '')).get();
     return normalizeModelList([profile.model, ...native]);
+}
+
+/** 解析 `预设名::profileId` 为 { preset, profileId }。 */
+function parsePresetCardsValue(value) {
+    const index = value.lastIndexOf('::');
+    if (index <= 0) return { preset: '', profileId: '' };
+    return { preset: value.slice(0, index), profileId: value.slice(index + 2) };
+}
+
+/** 把方案的 presetCards 组装为下拉 value（`预设名::profileId`）。 */
+function presetCardsValueOf(detailDraft) {
+    const preset = normalizeText(detailDraft?.presetCards?.preset);
+    const profileId = normalizeText(detailDraft?.presetCards?.profileId);
+    return preset && profileId ? `pc::${preset}::${profileId}` : '';
 }
 
 function normalizeQuickActionPlacement(value, fallback = 'rightSendForm') {
@@ -1782,7 +1819,8 @@ async function manageQuickActions() {
             return;
         }
         const name = $('<input class="text_pole" type="text" maxlength="120" placeholder="留空自动命名为方案N">').val(detailDraft.name);
-        const preset = $(`<select class="text_pole">${presetOptionsHtml(detailDraft.preset)}</select>`);
+        const presetCardsValue = presetCardsValueOf(detailDraft);
+        const preset = $(`<select class="text_pole">${presetOptionsHtml(detailDraft.preset, presetCardsValue)}</select>`);
         const profileSelect = $(`<select class="text_pole">${profileOptionsHtml(detailDraft.profileId)}</select>`);
         const modelInput = $('<input class="text_pole" type="text" maxlength="500" placeholder="可直接输入自定义模型 ID">').val(detailDraft.model);
         const modelSelect = $('<select class="text_pole" aria-label="从配置模型列表选择"></select>');
@@ -1798,7 +1836,18 @@ async function manageQuickActions() {
         const selectedProfileValue = () => profiles().find(item => item.id === detailDraft.profileId) || null;
         fetchModels.prop('disabled', selectedProfileValue()?.format !== 'openai');
         name.on('input', () => { detailDraft.name = sanitizeName(name.val()); updateDetailSaveState(); });
-        preset.on('change', () => { detailDraft.preset = normalizeText(preset.val()); updateDetailSaveState(); });
+        preset.on('change', () => {
+            const value = normalizeText(preset.val());
+            if (value.startsWith('pc::')) {
+                const parsed = parsePresetCardsValue(value.slice(3));
+                detailDraft.preset = '';
+                detailDraft.presetCards = { preset: parsed.preset, profileId: parsed.profileId };
+            } else {
+                detailDraft.preset = value;
+                delete detailDraft.presetCards;
+            }
+            updateDetailSaveState();
+        });
         profileSelect.on('change', () => {
             detailDraft.profileId = normalizeText(profileSelect.val());
             detailCandidates = modelSuggestionsForProfile(detailDraft.profileId);
@@ -1850,7 +1899,7 @@ async function manageQuickActions() {
         const saveScheme = $('<button type="button" class="menu_button quicker-api__save-button"><i class="fa-solid fa-floppy-disk"></i><span>保存方案</span></button>');
         const cancelScheme = $('<button type="button" class="menu_button"><span>取消</span></button>');
         saveScheme.on('click', () => {
-            if (!detailDraft.preset && !detailDraft.profileId && !detailDraft.model) return toastr.warning('方案至少需要 preset、Profile 或 model 中的一项。');
+            if (!detailDraft.preset && !detailDraft.profileId && !detailDraft.model && !detailDraft.presetCards?.preset) return toastr.warning('方案至少需要 preset、Profile、model 或 preset-cards profile 中的一项。');
             const index = globalDraft.findIndex(item => item.id === selectedId);
             if (index < 0) return;
             globalDraft[index] = normalizeQuickAction(structuredClone(detailDraft), index);
@@ -1864,6 +1913,7 @@ async function manageQuickActions() {
             $('<h4 class="quicker-api__quick-editor-title">').text('方案详情'),
             $('<div class="quicker-api__quick-editor-fields">').append(
                 field('名称', name), field('预设', preset), field('配置', profileSelect), field('模型', modelControl),
+                field('preset-cards profile', presetCardsSelect),
             ),
             $('<div class="quicker-api__quick-editor-actions">').append(saveScheme, cancelScheme),
         );
@@ -2046,6 +2096,15 @@ async function runQuickAction(action, token) {
         if (action.model && !applyExplicitModel(action.model, profile?.format || '')) {
             toastr.error('便捷方案模型写入验证失败。');
             return;
+        }
+        if (token !== quickActionTransaction) return;
+        // preset-cards profile 联动：preset 未显式指定时复用方案的对话补全预设名
+        if (action.presetCards?.profileId && typeof globalThis.presetCards?.loadProfile === 'function') {
+            const pcPreset = action.presetCards.preset || action.preset;
+            const pcOk = await globalThis.presetCards.loadProfile(pcPreset, action.presetCards.profileId);
+            if (!pcOk && token === quickActionTransaction) toastr.error('便捷方案的 preset-cards profile 未能加载。');
+        } else if (action.presetCards?.profileId && token === quickActionTransaction) {
+            toastr.warning('未检测到 preset-cards 扩展，跳过 profile 联动。');
         }
         if (token !== quickActionTransaction) return;
         renderProfiles(settings().selectedProfileId);
